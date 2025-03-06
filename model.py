@@ -28,10 +28,36 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
 
     assert head_dim % 2 == 0, "dimension should be divisible 2"
 
-    i = torch.arange(0, head_dim , 2)
+    # Build the theta parameter
+    # According to the formula theta_i = 10000^(-2(i-1)/dim) for i = [1, 2, ... dim/2]
+    # Shape: (Head_Dim / 2)
+    i = torch.arange(0, head_dim , 2) # the -2 part will be already dene when taken the arange with step of 2
 
-    theta = 1 / ( theta ** ((i - 1) / head_dim))
+    #  the - from -2 is used as invers of the equation so 1/....
+    theta = 1 / ( theta ** ((i - 1) / head_dim)) # we don't use -1 since we already starting from 0 value, we use -1 when i in the equation start from 1
 
+    # construct the position m 
+    m = torch.arange(0, seq_len, device=device)
+
+    freq = torch.outer(m, theta).float()
+
+    freq_complex = torch.polar(torch.ones_like(freq), freq)
+
+    return freq_complex
+
+def apply_rotary_postional_encoding(embedding: torch.Tensor, freq_complex_precomputed: torch.Tensor, device:str):
+    embedding_complex = torch.view_as_complex(embedding.float().reshape(*embedding.shape[:-1], -1, 2))\
+    
+    # add dimension to match with embedding dimension, we added dimension in batch and head, so it will broad cast
+    freq_complex_precomputed= freq_complex_precomputed.unsqueeze(0).unsqueeze(2) # (seqlen, head/2) -> (1, seqlen, 1, head/2), it will broadcast with the embedding from model
+
+    # Position wise multiplication
+    embedding_rotated = embedding_complex * freq_complex_precomputed
+
+    embedding_rotated_out = torch.view_as_real(embedding_rotated) # (batch, seq, head, head_dim/2, 2)
+    # now we change this back to the original embedding shape
+    embedding_out = embedding_rotated_out.reshape(*embedding)
+    return embedding_out
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs) -> None:
