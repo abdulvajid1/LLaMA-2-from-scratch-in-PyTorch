@@ -5,8 +5,6 @@ import math
 from dataclasses import dataclass
 
 
-
-
 @dataclass
 class ModelArgs:
 
@@ -46,19 +44,126 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
     return freq_complex
 
 def apply_rotary_postional_encoding(embedding: torch.Tensor, freq_complex_precomputed: torch.Tensor, device:str):
-    embedding_complex = torch.view_as_complex(embedding.float().reshape(*embedding.shape[:-1], -1, 2))\
-    
+    embedding_complex = torch.view_as_complex(embedding.float().reshape(*embedding.shape[:-1], -1, 2))
     # add dimension to match with embedding dimension, we added dimension in batch and head, so it will broad cast
     freq_complex_precomputed= freq_complex_precomputed.unsqueeze(0).unsqueeze(2) # (seqlen, head/2) -> (1, seqlen, 1, head/2), it will broadcast with the embedding from model
-
     # Position wise multiplication
     embedding_rotated = embedding_complex * freq_complex_precomputed
-
     embedding_rotated_out = torch.view_as_real(embedding_rotated) # (batch, seq, head, head_dim/2, 2)
     # now we change this back to the original embedding shape
     embedding_out = embedding_rotated_out.reshape(*embedding)
     return embedding_out
 
+# RMS Normalization Block
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6 ):
+        super().__init__()
+        self.eps = eps
+        self.dim = dim
+        self.gamma_parameter = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps )
+    
+    def forward(self, x):
+        return self.gamma_parameter * self._norm(x) # i have something to add here, if there is eror , check the code hre x.float().type_as(x)
+    
+class EncoderBlock(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+
+        self.attention = SelfAttention(args)
+        self.feed_forward = FeedForward(args)
+
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def forward(self, x: torch.Tensor, start_pos: int, freq_complex: torch.Tensor):
+        h = x + self.attention(self.attention_norm(x), start_pos, freq_complex) # the vid used forward method directly here? why?
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+    
+class SelfAttention(nn.Module):
+
+    def __init__(self, args):
+        super().__init__()
+
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_heads_q =  args.n_heads
+        self.n_rep = self.n_heads_q // self.n_kv_heads
+        self.head_dim = args.dim // args.n_heads
+
+        self.wq = nn.Linear(args.dim, self.head_dim * self.n_heads_q)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim)
+        self.wo = nn.Linear(self.head_dim * args.n_heads, args.dim)
+
+        self.cache_k = torch.zeros((args.batch_size, args.max_seq_len, self.n_kv_heads , self.head_dim))
+        self.cache_v = torch.zeros((args.batch_size, args.max_seq_len, self.n_kv_heads , self.head_dim))
+
+    
+    # number of heads in key and value can be differant from query heads since this is grouped query
+    # we need to repeate the key metrix so it will match the same head number as query, so matrix multiplicatoin work without any problem
+    def repeat_kv(self, x):
+        batch_size, seq_len, n_kv_heads, head_dim = x.shape
+        if self.n_rep == 1:
+            return x
+        else:
+            return ( 
+                x[:,:,:,None,:].expand(batch_size, seq_len, self.n_kv_heads, self.n_rep ,self.head_dim)
+                .reshape(batch_size, seq_len, n_kv_heads * self.n_rep , head_dim)
+                )
+    
+    def forward(self, x, freq_complex, start_pos):
+        batch_size, seq_len, _ = x.shape
+
+        xq = self.wq(x)
+        xk = self.wk(x)
+        xv = self.wv(x)
+
+        xq = xq.view(batch_size, seq_len, self.n_heads_q, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+
+        # Apply rotary postional embedding to query and key heads
+        xq = apply_rotary_postional_encoding(xq, freq_complex)
+        xk = apply_rotary_postional_encoding(xk, freq_complex)
+
+        # add key and value matrix to cache
+        self.cache_k[:batch_size, start_pos: start_pos + seq_len] = xk
+        self.cache_v[:batch_size, start_pos: start_pos + seq_len] = xv
+
+        # retrive all the key and value caches so for
+        key =  self.cache_k[:batch_size, 0:start_pos+seq_len]
+        value =  self.cache_k[:batch_size, 0:start_pos+seq_len]
+
+        keys = self.repeat_kv(key)
+        values = self.repeat_kv(value)
+
+        # (B, 1, H, head_dim) -> (B, H, 1 head_dim)
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # (B, H, 1, head_dim) * (B, H, head_dim, seq_len) -> (B, H, 1, Seq_len)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        
+        # (B, H, 1, Seq_len) * (B, H, Seq_len, head_dim) -> (B, H, 1, head_dim)
+        output = torch.matmul(scores, values)
+
+        # (B, 1, H, head_dim) -> (B, S, d_value)
+        output = (output.transpose(1, 2).contiguous.view(batch_size, seq_len, -1))
+
+        # return output with final linear layer to capture more complex pattern
+        return self.wo(output)
+            
+
+# Transfomer Skelton
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs) -> None:
         super().__init__()
@@ -85,9 +190,7 @@ class Transformer(nn.Module):
 
         batch_size, seq_len = tokens.shape
         assert seq_len == 1, "only one token at a time can be processed"
-
         h = self.token_embdding(tokens)
-
         freq_complex = self.freq_complex[start_pos: start_pos + seq_len]
 
         for encoder_layer in self.layers:
