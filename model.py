@@ -54,6 +54,30 @@ def apply_rotary_postional_encoding(embedding: torch.Tensor, freq_complex_precom
     embedding_out = embedding_rotated_out.reshape(*embedding)
     return embedding_out
 
+class FeedForward(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        hidden_size = 4 * args.dim
+        hidden_size = int(2 * hidden_size // 3)
+        
+        
+        if args.ffn_dim_multiplier is not None:
+            hidden_size = int(hidden_size * args.ffn_dim_multiplier)
+
+        hidden_size = args.multiple_of * (hidden_size + args.multiple_of - 1) // args.multiple_of
+
+        self.w1 = nn.Linear(args.dim, hidden_size, bias=False)
+        self.w2 = nn.Linear(hidden_size, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, hidden_size, bias=False)
+
+    def forward(self, x):
+        swish =  F.silu(self.w1(x))
+        x_V = self.w3(x)
+        x = swish * x_V
+        x = self.w2(x)
+        return x
+
 # RMS Normalization Block
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6 ):
@@ -156,7 +180,7 @@ class SelfAttention(nn.Module):
         # (B, H, 1, Seq_len) * (B, H, Seq_len, head_dim) -> (B, H, 1, head_dim)
         output = torch.matmul(scores, values)
 
-        # (B, 1, H, head_dim) -> (B, S, d_value)
+        # (B, 1, H, head_dim) -> (B, Seq_len, d_value)
         output = (output.transpose(1, 2).contiguous.view(batch_size, seq_len, -1))
 
         # return output with final linear layer to capture more complex pattern
