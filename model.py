@@ -180,7 +180,7 @@ class SelfAttention(nn.Module):
         # (B, H, 1, Seq_len) * (B, H, Seq_len, head_dim) -> (B, H, 1, head_dim)
         output = torch.matmul(scores, values)
 
-        # (B, 1, H, head_dim) -> (B, Seq_len, d_value)
+        # (B, 1, H, head_dim) -> (B, 1, d_value)
         output = (output.transpose(1, 2).contiguous.view(batch_size, seq_len, -1))
 
         # return output with final linear layer to capture more complex pattern
